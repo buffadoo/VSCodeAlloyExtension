@@ -1,3 +1,6 @@
+## 0.8.1
+- Updated to work with Alloy 6.3
+
 ## 0.7.1
 - Fixed a bug where the LSP server would start before the client was ready and then die.
 

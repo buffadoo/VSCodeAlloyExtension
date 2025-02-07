@@ -15,57 +15,72 @@ import {
 	CodeLensRequest,
 	CodeLensParams,
 	DocumentLink,
-	SymbolKind,
+	SymbolKind
 } from 'vscode-languageclient';
+import { ViewColumn } from 'vscode';
 
 import net = require('net');
 import fs = require('fs');
 import { ChildProcess, spawn } from 'child_process';
 import { TextDocument, Uri } from 'vscode';
 import { log } from 'util';
+import * as path from 'path';
+import * as os from 'os';
 
+const ACTIVATION_DEBUG = true;
 
-let lsProc: ChildProcess;
+let lsProc: ChildProcess | undefined;
 let client: LanguageClient;
 let alloyWebViewContent: string;
 let latestInstanceLink : string | null = null;
+let outputChannel: vscode.OutputChannel;
 
 function isAlloyLangId (id : String) : boolean {
 	return id === "alloy" || id === "markdown";
 } 
 
 export async function activate(context: vscode.ExtensionContext) {
-	const console = vscode.window.createOutputChannel("Alloy Extension");
+	outputChannel = vscode.window.createOutputChannel("Alloy Extension");
+	outputChannel.show();
 
+	outputChannel.appendLine("Alloy Extension Activating...");
+	
 	const alloyJar = context.asAbsolutePath("org.alloytools.alloy.dist.jar");
-	console.appendLine("alloyJar: " + alloyJar);
+	outputChannel.appendLine("alloyJar: " + alloyJar);
 	
 	alloyWebViewContent = fs.readFileSync(context.asAbsolutePath("AlloyPanel.html")).toString();
 	
 
-	let disposable = vscode.commands.registerCommand('ExecuteAlloyCommand', (uri: String, ind: number, line: number, char: number) => {
-		console.appendLine("ExecuteAlloyCommand called!");
-		client.sendNotification("ExecuteAlloyCommand", [uri, ind, line, char]);
+	let disposable = vscode.commands.registerCommand('alloy.executeCommand', (uri: String, ind: number, line: number, char: number) => {
+		outputChannel.appendLine(`executeCommand called with uri: ${uri}, ind: ${ind}, line: ${line}, char: ${char}`);
+		if (typeof uri === 'string') {  // Make sure uri is a string
+			client.sendNotification("ExecuteAlloyCommand", [uri, ind, line, char]);
+		} else {
+			outputChannel.appendLine("Error: uri is not a string");
+		}
 	});
 	context.subscriptions.push(disposable);
 
 	disposable = vscode.commands.registerCommand('alloy.executeAllCommands', () => {
+		debugger;
 		let editor = vscode.window.activeTextEditor;
 		if (editor && !editor.document.isUntitled && isAlloyLangId(editor.document.languageId)){
 			client.sendNotification("ExecuteAlloyCommand", [editor.document.uri.toString(), -1, 0, 0]);
 		}
 	});
 	context.subscriptions.push(disposable);
+	outputChannel.appendLine("Command registered: alloy.executeAllCommands");
 	
 	disposable = vscode.commands.registerCommand('alloy.openAlloyEditor', () => {
 		let editor = vscode.window.activeTextEditor;
 		if(editor && !editor.document.isUntitled && isAlloyLangId(editor.document.languageId)){
-			spawn("java", ["-jar", alloyJar, editor.document.fileName] );
+			spawn("java", ["-jar", alloyJar, 'gui', editor.document.fileName] );
 		}else{
 			spawn("java", ["-jar", alloyJar] );
 		}
 	});
 	context.subscriptions.push(disposable);
+	outputChannel.appendLine("Registered openAlloyEditor command");
 	
 	disposable = vscode.commands.registerCommand('alloy.listCommands', () => {
 		let editor = vscode.window.activeTextEditor;
@@ -74,7 +89,7 @@ export async function activate(context: vscode.ExtensionContext) {
 	});
 	context.subscriptions.push(disposable);
 
-	
+
 	disposable = vscode.commands.registerCommand('alloy.openLatestInstance', () => {
 		if(latestInstanceLink)
 			client.sendNotification("OpenModel", latestInstanceLink);
@@ -119,10 +134,20 @@ export async function activate(context: vscode.ExtensionContext) {
 	let middleware: Middleware = {
 		
 		provideCodeLenses : ( document: TextDocument, token: CancellationToken, next: ProvideCodeLensesSignature) => {
-			let mode  = vscode.workspace.getConfiguration("alloy").get("commandHighlightMode", "") ;
+			let mode = vscode.workspace.getConfiguration("alloy").get("commandHighlightMode", "") ;
 			let res = next(document, token);
-			actOnProvideResult(res, codeLensRes => commands.set(document.uri, codeLensRes));
-
+			outputChannel.appendLine(`CodeLens requested for ${document.uri}, mode: ${mode}`);
+			actOnProvideResult(res, codeLensRes => {
+				if (codeLensRes) {
+					codeLensRes.forEach(lens => {
+						if (lens.command) {
+							lens.command.command = 'alloy.executeCommand';
+							outputChannel.appendLine(`CodeLens command: ${lens.command.command}, args: ${JSON.stringify(lens.command.arguments)}`);
+						}
+					});
+				}
+				commands.set(document.uri, codeLensRes)
+			});
 			return mode === "codelens" ? res : [];
 		},
 
@@ -138,7 +163,7 @@ export async function activate(context: vscode.ExtensionContext) {
 	};
 
 	// Create the language client
-	console.appendLine("starting language client on port " + port);
+	outputChannel.appendLine("starting language client on port " + port);
 	client = new LanguageClient(
 		'AlloyLanguageService',
 		'Alloy Language Service',
@@ -158,46 +183,58 @@ export async function activate(context: vscode.ExtensionContext) {
 				.then(item => {
 					vscode.commands.executeCommand(item!.command.command, ...item!.command.arguments!);
 			});
-			console.appendLine(JSON.stringify(res));
+			outputChannel.appendLine(JSON.stringify(res));
 
 		});
 	});
 	client.start();
-	console.appendLine("LanguageClient started.");
+	outputChannel.appendLine("LanguageClient started.");
 
-	console.appendLine("Starting the Alloy process...");
+	outputChannel.appendLine("Starting the Alloy process...");
 	lsProc = spawn(serverExec.command, serverExec.args, serverExec.options);
 
 	lsProc.on("exit", (code, signal) => {
-		console.appendLine("Alloy JAR process exited. code: " + code + (signal ? "; signal: " + signal : ""));
+		outputChannel.appendLine("Alloy JAR process exited. code: " + code + (signal ? "; signal: " + signal : ""));
 	});
 	lsProc.on("error", (err) => {
-		console.appendLine("ERROR CREATING ALLOY PROCESS: " + err);
+		outputChannel.appendLine("ERROR CREATING ALLOY PROCESS: " + err);
 		vscode.window.showErrorMessage("Could not start the Alloy process, make sure Java is installed and included in PATH." +
 										" Error: " + err.message);
 	});
 	if (lsProc.pid){
-		console.appendLine("Alloy language server process (Alloy JAR) started. PID: " + lsProc.pid);
+		outputChannel.appendLine("Alloy language server process (Alloy JAR) started. PID: " + lsProc.pid);
 	}
 
 	lsProc.stdout.on("data", data => {
-		console.appendLine("Server: " + data.toString());
+		outputChannel.appendLine("Server: " + data.toString());
 	});
 	lsProc.stderr.on("data", data => {
-		console.appendLine("Server err: " + data.toString());
+		outputChannel.appendLine("Server err: " + data.toString());
 	});
 
 	let _webViewPanel : vscode.WebviewPanel | null;
 	let getWebViewPanel = () => {
+		outputChannel.appendLine("getWebViewPanel called");
+		
 		if (_webViewPanel){
-			if (! _webViewPanel.visible) _webViewPanel.reveal(_webViewPanel.viewColumn, true);
+			outputChannel.appendLine("Existing panel found");
+			if (! _webViewPanel.visible) {
+				outputChannel.appendLine("Panel not visible, revealing");
+				_webViewPanel.reveal(_webViewPanel.viewColumn, true);
+			}
 			return _webViewPanel;
 		}
 
-		let webViewPanelOptions: vscode.WebviewPanelOptions & vscode.WebviewOptions = {
+		outputChannel.appendLine("Creating new WebView panel");
+		let webViewPanelOptions: vscode.WebviewOptions & vscode.WebviewPanelOptions = {
 			enableScripts: true,
-			retainContextWhenHidden: true
+			retainContextWhenHidden: true,
+			localResourceRoots: [
+				vscode.Uri.file(context.extensionPath)
+			],
+			enableCommandUris: true
 		};
+		
 		_webViewPanel = vscode.window.createWebviewPanel("side bar", "Alloy", 
 			{viewColumn :  vscode.ViewColumn.Beside, preserveFocus: false}, webViewPanelOptions);
 
@@ -238,7 +275,9 @@ export async function activate(context: vscode.ExtensionContext) {
 
 // this method is called when the extension is deactivated
 export function deactivate() {
-	lsProc.kill();
+	if (lsProc) {
+		lsProc.kill();
+	}
 }
 
 async function createClientOwnedTCPServerOptions(port: number): Promise<ServerOptions> {
@@ -251,7 +290,7 @@ async function createClientOwnedTCPServerOptions(port: number): Promise<ServerOp
 			resolve(res);
 		}).listen(port, "localhost", () => continuation())
 		.on("error", (err) => {
-			console.log("error listening: " + err);
+			log("error listening: " + err);
 			rejectedContinuation(err);
 		});
 	});
