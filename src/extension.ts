@@ -27,7 +27,7 @@ import { log } from 'util';
 import * as path from 'path';
 import * as os from 'os';
 
-const ACTIVATION_DEBUG = true;
+const ACTIVATION_DEBUG = false;
 
 let lsProc: ChildProcess | undefined;
 let client: LanguageClient;
@@ -39,11 +39,19 @@ function isAlloyLangId (id : String) : boolean {
 	return id === "alloy" || id === "markdown";
 } 
 
+// Add debug logging helper
+function debugLog(message: string) {
+    if (ACTIVATION_DEBUG) {
+        outputChannel.appendLine(message);
+    }
+}
+
 export async function activate(context: vscode.ExtensionContext) {
 	outputChannel = vscode.window.createOutputChannel("Alloy Extension");
 	outputChannel.show();
 
-	outputChannel.appendLine("Alloy Extension Activating...");
+	// Keep only essential startup log
+	debugLog("Alloy Extension Activating...");
 	
 	const alloyJar = context.asAbsolutePath("org.alloytools.alloy.dist.jar");
 	outputChannel.appendLine("alloyJar: " + alloyJar);
@@ -52,11 +60,9 @@ export async function activate(context: vscode.ExtensionContext) {
 	
 
 	let disposable = vscode.commands.registerCommand('alloy.executeCommand', (uri: String, ind: number, line: number, char: number) => {
-		outputChannel.appendLine(`executeCommand called with uri: ${uri}, ind: ${ind}, line: ${line}, char: ${char}`);
-		if (typeof uri === 'string') {  // Make sure uri is a string
+		debugLog(`executeCommand called with uri: ${uri}, ind: ${ind}, line: ${line}, char: ${char}`);
+		if (typeof uri === 'string') {
 			client.sendNotification("ExecuteAlloyCommand", [uri, ind, line, char]);
-		} else {
-			outputChannel.appendLine("Error: uri is not a string");
 		}
 	});
 	context.subscriptions.push(disposable);
@@ -136,13 +142,12 @@ export async function activate(context: vscode.ExtensionContext) {
 		provideCodeLenses : ( document: TextDocument, token: CancellationToken, next: ProvideCodeLensesSignature) => {
 			let mode = vscode.workspace.getConfiguration("alloy").get("commandHighlightMode", "") ;
 			let res = next(document, token);
-			outputChannel.appendLine(`CodeLens requested for ${document.uri}, mode: ${mode}`);
+			debugLog(`CodeLens requested for ${document.uri}`);
 			actOnProvideResult(res, codeLensRes => {
 				if (codeLensRes) {
 					codeLensRes.forEach(lens => {
 						if (lens.command) {
 							lens.command.command = 'alloy.executeCommand';
-							outputChannel.appendLine(`CodeLens command: ${lens.command.command}, args: ${JSON.stringify(lens.command.arguments)}`);
 						}
 					});
 				}
@@ -172,10 +177,16 @@ export async function activate(context: vscode.ExtensionContext) {
 		false
 	);
 
+	// Register the notification handlers before starting the client
 	client.onReady().then(() => {
+		debugLog("Client ready, registering notification handlers...");
+		
 		client.onNotification("alloy/showExecutionOutput", (req: { message: string, messageType: number, bold: boolean }) => {
 			getWebViewPanel().webview.postMessage(req);
 		});
+
+		outputChannel.appendLine("About to register OpenModel handler");
+		
 		client.onNotification("alloy/commandsListResult", res => {
 			let commands : {title: string, command: Command}[] = res.commands;
 			let qpitems = commands.map(item => ({ label: item.title, command: item.command}));
@@ -184,9 +195,25 @@ export async function activate(context: vscode.ExtensionContext) {
 					vscode.commands.executeCommand(item!.command.command, ...item!.command.arguments!);
 			});
 			outputChannel.appendLine(JSON.stringify(res));
-
 		});
+
+		client.onNotification("alloy/OpenModel", (path) => {
+			outputChannel.appendLine(`Handler triggered for OpenModel with path: ${path}`);
+			
+			// Keep error logging and essential process info
+			const killProcess = spawn("pkill", ["-f", "viz"]);
+			killProcess.on('close', () => {
+				const vizProcess = spawn("java", ["-jar", alloyJar, 'viz', path]);
+				
+				vizProcess.on('error', (err) => {
+					outputChannel.appendLine(`Error starting visualizer: ${err}`);
+				});
+			});
+		});
+
+		outputChannel.appendLine("Notification handlers registered");
 	});
+
 	client.start();
 	outputChannel.appendLine("LanguageClient started.");
 
@@ -206,26 +233,30 @@ export async function activate(context: vscode.ExtensionContext) {
 	}
 
 	lsProc.stdout.on("data", data => {
-		outputChannel.appendLine("Server: " + data.toString());
+		const message = data.toString();
+		if (!message.includes("thread:") && !message.includes("link message!!!")) {
+			debugLog(`Server: ${message}`);
+		}
 	});
 	lsProc.stderr.on("data", data => {
-		outputChannel.appendLine("Server err: " + data.toString());
+		const message = data.toString();
+		if (message.includes("ERROR") || message.includes("WARN")) {
+			outputChannel.appendLine(`Server error: ${message}`);
+		}
 	});
 
-	let _webViewPanel : vscode.WebviewPanel | null;
+	let _webViewPanel: vscode.WebviewPanel | null;
 	let getWebViewPanel = () => {
-		outputChannel.appendLine("getWebViewPanel called");
-		
-		if (_webViewPanel){
-			outputChannel.appendLine("Existing panel found");
-			if (! _webViewPanel.visible) {
-				outputChannel.appendLine("Panel not visible, revealing");
+		if (_webViewPanel) {
+			if (!_webViewPanel.visible) {
 				_webViewPanel.reveal(_webViewPanel.viewColumn, true);
 			}
 			return _webViewPanel;
 		}
 
-		outputChannel.appendLine("Creating new WebView panel");
+		// Only log when creating a new panel
+		debugLog("Creating new WebView panel");
+		
 		let webViewPanelOptions: vscode.WebviewOptions & vscode.WebviewPanelOptions = {
 			enableScripts: true,
 			retainContextWhenHidden: true,
@@ -235,27 +266,37 @@ export async function activate(context: vscode.ExtensionContext) {
 			enableCommandUris: true
 		};
 		
-		_webViewPanel = vscode.window.createWebviewPanel("side bar", "Alloy", 
-			{viewColumn :  vscode.ViewColumn.Beside, preserveFocus: false}, webViewPanelOptions);
+		_webViewPanel = vscode.window.createWebviewPanel(
+			"side bar", 
+			"Alloy", 
+			{viewColumn: vscode.ViewColumn.Beside, preserveFocus: false}, 
+			webViewPanelOptions
+		);
 
 		_webViewPanel.webview.html = alloyWebViewContent;
-		_webViewPanel.webview.onDidReceiveMessage( (req : {method : "model" | "stop" | "instanceCreated" , data: any}) => {
-			if (req.method === "model"){
-				client.sendNotification("OpenModel", req.data.link);
-				latestInstanceLink = req.data.link;
-			} else if (req.method === "instanceCreated"){
-				latestInstanceLink = req.data.link;
-			} else if (req.method === "stop")
-				client.sendNotification("StopExecution");
-		});
-
-		_webViewPanel.onDidDispose( () => {
+		_webViewPanel.webview.onDidReceiveMessage(handleWebViewMessage);
+		_webViewPanel.onDidDispose(() => {
 			_webViewPanel = null;
 		});
 
-		_webViewPanel.reveal();
 		return _webViewPanel;
 	};
+
+	// Separate message handler function
+	function handleWebViewMessage(req: {method: "model" | "stop" | "instanceCreated", data: any}) {
+		switch (req.method) {
+			case "model":
+				client.sendNotification("OpenModel", req.data.link);
+				latestInstanceLink = req.data.link;
+				break;
+			case "instanceCreated":
+				latestInstanceLink = req.data.link;
+				break;
+			case "stop":
+				client.sendNotification("StopExecution");
+				break;
+		}
+	}
 
 	// class AlloyCommandsTreeDataProvider implements vscode.TreeDataProvider<String>{
 	// 	onDidChangeTreeData?: vscode.Event<String | null | undefined> | undefined;		
